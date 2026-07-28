@@ -1,0 +1,47 @@
+# Gradle / Kotlin
+.gradle/
+.kotlin/
+build/
+**/build/
+
+# Android Studio / IntelliJ
+.idea/
+*.iml
+/.idea/caches/
+/.idea/libraries/
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
+
+# Android build outputs
+captures/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.ap_
+*.aab
+*.dex
+*.class
+app/release/
+app/src/test/screenshots/
+
+# Local configuration and secrets
+local.properties
+.env
+*.jks
+*.keystore
+debug.keystore
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local AI/tool scratch output
+.deepseek/
+.superpowers/
+docs/superpowers/
+assets/
+metadata.json
+CHANGES_SUMMARY.md
+algorithm_design.txt
