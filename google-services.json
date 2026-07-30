@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "273978005013",
+    "project_id": "fluxa-wallpapers-2026",
+    "storage_bucket": "fluxa-wallpapers-2026.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:273978005013:android:6888b68d3e8c7b95dae01c",
+        "android_client_info": {
+          "package_name": "com.fluxawallpapers.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCMDxhtpsVxWCtD7IqW0MA-Eh9dppU8Xf0"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
