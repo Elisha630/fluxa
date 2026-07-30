@@ -129,13 +129,15 @@ class FirebaseManager(private val context: Context) {
     }
 
     private fun getActionWeight(action: String): Float {
+        // Matches WallpaperAction.name (as passed from WallpaperRepository.recordWallpaperAction),
+        // plus a few legacy/alternate aliases for backward compatibility.
         return when (action.lowercase()) {
-            "set_wallpaper" -> 3.0f
+            "set", "set_wallpaper" -> 3.0f
             "save", "pin" -> 2.0f
-            "view", "click" -> 1.0f
+            "view_long", "view", "click" -> 1.0f
             "long_press" -> 0.5f
             "search" -> 1.5f
-            "dismiss" -> -2.0f
+            "skip", "dismiss" -> -2.0f
             "rapid_skip" -> -1.0f
             else -> 0.0f
         }

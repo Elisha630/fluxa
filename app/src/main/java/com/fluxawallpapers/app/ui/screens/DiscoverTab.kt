@@ -112,6 +112,8 @@ fun CategoryResultsContent(
     onWallpaperClick: (Int, List<Wallpaper>) -> Unit
 ) {
     val searchState by viewModel.searchState.collectAsState()
+    val pinnedWallpapers by viewModel.pinnedWallpapers.collectAsState()
+    val pinnedWallpaperIds = remember(pinnedWallpapers) { pinnedWallpapers.map { it.id }.toSet() }
 
     Column(
         modifier = Modifier
@@ -154,7 +156,8 @@ fun CategoryResultsContent(
                                 onWallpaperClick = { index -> onWallpaperClick(index, state.list) },
                                 onEndReached = { viewModel.fetchNextSearchPage() },
                                 isLoadingMore = state.isAppending,
-                                onPinClick = { wp -> viewModel.togglePin(wp, !wp.isPinned) }
+                                pinnedIds = pinnedWallpaperIds,
+                                onPinClick = { wp -> viewModel.togglePin(wp, wp.id !in pinnedWallpaperIds) }
                             )
                         }
                     }

@@ -43,15 +43,23 @@ fun WallpaperGrid(
     onEndReached: () -> Unit,
     isLoadingMore: Boolean = false,
     gridState: LazyStaggeredGridState = rememberLazyStaggeredGridState(),
-    onPinClick: (Wallpaper) -> Unit = {}
+    onPinClick: (Wallpaper) -> Unit = {},
+    // Authoritative set of pinned wallpaper IDs (e.g. sourced from viewModel.pinnedWallpapers).
+    // Feed/search items come straight from the network APIs and always have isPinned = false,
+    // so without this the pin icon would silently revert to "unpinned" on every refresh or
+    // pagination even for wallpapers the user already pinned. When null, falls back to each
+    // item's own isPinned flag (correct for lists already sourced from the DB, e.g. Favorites).
+    pinnedIds: Set<String>? = null
 ) {
-    // Local pinned-state cache for instant UI feedback
-    val pinnedIds = remember { mutableStateMapOf<String, Boolean>() }
-    // Sync local state from list (catches external changes like unpin from detail view)
-    LaunchedEffect(list) {
-        pinnedIds.clear()
-        for (wp in list) {
-            if (wp.isPinned) pinnedIds[wp.id] = true
+    // Local optimistic overrides for instant UI feedback on tap, before the DB write round-trips
+    // back through pinnedIds.
+    val optimisticOverrides = remember { mutableStateMapOf<String, Boolean>() }
+    // Once the authoritative source confirms an override's value, drop the override so it
+    // doesn't linger and mask genuine future external changes.
+    LaunchedEffect(pinnedIds) {
+        if (pinnedIds != null) {
+            val confirmed = optimisticOverrides.keys.filter { id -> optimisticOverrides[id] == (id in pinnedIds) }
+            confirmed.forEach { optimisticOverrides.remove(it) }
         }
     }
     val staggeredGridState = gridState
@@ -83,7 +91,8 @@ fun WallpaperGrid(
         ) {
             items(list.size) { index ->
                 val wallpaper = list[index]
-                val isPinnedLocal = wallpaper.isPinned || pinnedIds.containsKey(wallpaper.id)
+                val basePinned = pinnedIds?.contains(wallpaper.id) ?: wallpaper.isPinned
+                val isPinnedLocal = optimisticOverrides[wallpaper.id] ?: basePinned
 
                 Box(
                     modifier = Modifier
@@ -102,12 +111,7 @@ fun WallpaperGrid(
                     // Pin toggle icon — top-right corner
                     IconButton(
                         onClick = {
-                            val newState = !isPinnedLocal
-                            if (newState) {
-                                pinnedIds[wallpaper.id] = true
-                            } else {
-                                pinnedIds.remove(wallpaper.id)
-                            }
+                            optimisticOverrides[wallpaper.id] = !isPinnedLocal
                             onPinClick(wallpaper)
                         },
                         modifier = Modifier
@@ -145,7 +149,7 @@ fun WallpaperGrid(
                     ) {
                         Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                             SourceBadge(wallpaper.source)
-                            if (wallpaper.isPinned) {
+                            if (isPinnedLocal) {
                                 SourceBadge("PINNED")
                             }
                         }

@@ -73,6 +73,8 @@ fun HomeTabContent(
 ) {
     val feedState by viewModel.feedState.collectAsState()
     val searchState by viewModel.searchState.collectAsState()
+    val pinnedWallpapers by viewModel.pinnedWallpapers.collectAsState()
+    val pinnedWallpaperIds = remember(pinnedWallpapers) { pinnedWallpapers.map { it.id }.toSet() }
 
     val searchQuery by viewModel.searchQuery.collectAsState()
     val searchPredictionItems by viewModel.searchPredictionItems.collectAsState()
@@ -391,7 +393,8 @@ fun HomeTabContent(
                                     onWallpaperClick = { index -> onWallpaperClick(index, result.list) },
                                     onEndReached = { viewModel.fetchNextSearchPage() },
                                     isLoadingMore = result.isAppending,
-                                    onPinClick = { wp -> viewModel.togglePin(wp, !wp.isPinned) }
+                                    pinnedIds = pinnedWallpaperIds,
+                                    onPinClick = { wp -> viewModel.togglePin(wp, wp.id !in pinnedWallpaperIds) }
                                 )
                             }
                         }
@@ -496,7 +499,8 @@ fun HomeTabContent(
                                     onEndReached = { viewModel.fetchNextFeedPage() },
                                     isLoadingMore = displayIsAppending,
                                     gridState = gridState,
-                                    onPinClick = { wp -> viewModel.togglePin(wp, !wp.isPinned) }
+                                    pinnedIds = pinnedWallpaperIds,
+                                    onPinClick = { wp -> viewModel.togglePin(wp, wp.id !in pinnedWallpaperIds) }
                                 )
                             }
 

@@ -69,14 +69,17 @@ fun WallpaperDetailView(
 
     val currentWallpaper = wallpaperList.getOrNull(pagerState.currentPage)
 
-    var startTime by remember { mutableLongStateOf(System.currentTimeMillis()) }
-    LaunchedEffect(pagerState.currentPage) {
-        startTime = System.currentTimeMillis()
-    }
+    // Capture the wallpaper being viewed and its entry time locally within a single effect,
+    // keyed on the page. Each time the page changes, a fresh onDispose closure is created that
+    // captures THIS page's wallpaper and entry timestamp — so the previous page's duration is
+    // computed correctly, instead of racing against a shared mutable `startTime` that a second
+    // effect could update before the outgoing page's dispose callback reads it.
     DisposableEffect(pagerState.currentPage) {
+        val enteredWallpaper = currentWallpaper
+        val enteredAt = System.currentTimeMillis()
         onDispose {
-            currentWallpaper?.let { wp ->
-                val duration = (System.currentTimeMillis() - startTime) / 1000L
+            enteredWallpaper?.let { wp ->
+                val duration = (System.currentTimeMillis() - enteredAt) / 1000L
                 viewModel.recordViewDuration(wp, duration)
             }
         }
@@ -143,9 +146,17 @@ fun WallpaperDetailView(
                                 .fillMaxSize()
                                 .pointerInput(Unit) {
                                     detectTransformGestures { _, pan, zoom, _ ->
-                                        scale = (scale * zoom).coerceIn(1f, 5f)
-                                        offsetX += pan.x
-                                        offsetY += pan.y
+                                        val newScale = (scale * zoom).coerceIn(1f, 5f)
+                                        scale = newScale
+                                        if (newScale <= 1f) {
+                                            // Back at baseline zoom — recenter so a leftover pan
+                                            // offset can't leave the image visibly off-center.
+                                            offsetX = 0f
+                                            offsetY = 0f
+                                        } else {
+                                            offsetX += pan.x
+                                            offsetY += pan.y
+                                        }
                                     }
                                 }
                         ) {
@@ -509,9 +520,15 @@ private fun FullScreenPreviewMode(
                 )
                 .pointerInput(Unit) {
                     detectTransformGestures { _, pan, zoom, _ ->
-                        scale = (scale * zoom).coerceIn(1f, 4f)
-                        offsetX += pan.x
-                        offsetY += pan.y
+                        val newScale = (scale * zoom).coerceIn(1f, 4f)
+                        scale = newScale
+                        if (newScale <= 1f) {
+                            offsetX = 0f
+                            offsetY = 0f
+                        } else {
+                            offsetX += pan.x
+                            offsetY += pan.y
+                        }
                     }
                 }
                 .pointerInput(Unit) {
