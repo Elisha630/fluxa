@@ -32,6 +32,7 @@ local.properties
 *.jks
 *.keystore
 debug.keystore
+/app/google-services.json
 
 # OS files
 .DS_Store
