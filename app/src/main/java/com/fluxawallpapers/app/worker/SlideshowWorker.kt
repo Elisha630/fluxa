@@ -28,20 +28,29 @@ class SlideshowWorker(
 
         val repository = AppInjector.provideRepository(applicationContext)
 
+        // Cap decoded bitmaps well below the raw 4096 default. In "Both" (home + lock) mode we
+        // can hold two full wallpaper bitmaps in memory at once; at the old 4096 cap that's two
+        // roughly 64 MB ARGB_8888 bitmaps. 2048px on the long side is still well above most phone
+        // screen resolutions, at a quarter of the memory.
+        val maxSlideshowDimension = 2048
+
         // Helper to load a wallpaper bitmap from cache or download
         suspend fun loadWallpaperBitmap(wallpaper: Wallpaper): Bitmap? {
             return try {
                 val cachedPath = repository.getCachedPath(wallpaper.id)
                 if (cachedPath != null && File(cachedPath).exists()) {
-                    BitmapUtils.safeDecodeBitmap(cachedPath)
+                    BitmapUtils.safeDecodeBitmap(cachedPath, maxSlideshowDimension)
                 } else {
                     val downloadedPath = repository.downloadWallpaperToCache(wallpaper)
                     if (downloadedPath != null) {
-                        BitmapUtils.safeDecodeBitmap(downloadedPath)
+                        BitmapUtils.safeDecodeBitmap(downloadedPath, maxSlideshowDimension)
                     } else {
-                        downloadBitmap(wallpaper.imageUrl)
+                        downloadBitmap(wallpaper.imageUrl, maxSlideshowDimension)
                     }
                 }
+            } catch (e: OutOfMemoryError) {
+                FluxaLog.e("OOM loading slideshow bitmap: ${e.message}", e)
+                null
             } catch (e: Exception) {
                 FluxaLog.e("Failed to load slideshow bitmap: ${e.message}", e)
                 null
@@ -51,7 +60,12 @@ class SlideshowWorker(
         // Use a try/catch/finally that covers all paths so that rescheduling always happens
         // (except when slideshow is explicitly disabled). This is more robust than PeriodicWorkRequest
         // which could be suppressed by Doze mode / battery optimization on various Android devices.
+        //
+        // Catch OutOfMemoryError explicitly below so failures during decode/apply still return a
+        // WorkManager result and still reach the rescheduling block.
         var result: Result
+        var homeBitmap: Bitmap? = null
+        var lockBitmap: Bitmap? = null
         try {
             // 1. Check if slideshow is enabled
             if (!repository.getSlideshowEnabled()) {
@@ -89,68 +103,91 @@ class SlideshowWorker(
             }
 
             // 3. Load bitmaps
-            val homeBitmap = loadWallpaperBitmap(homeWallpaper)
-            if (homeBitmap == null) {
+            homeBitmap = loadWallpaperBitmap(homeWallpaper)
+            val loadedHomeBitmap = homeBitmap
+            if (loadedHomeBitmap == null) {
                 FluxaLog.e("SlideshowWorker: Home bitmap is null. Auto-rotation aborted.")
                 return@withContext Result.failure()
             }
 
-            val lockBitmap: Bitmap? = if (lockWallpaper != null) {
+            lockBitmap = if (lockWallpaper != null) {
                 loadWallpaperBitmap(lockWallpaper)
             } else {
-                homeBitmap // reuse same bitmap for lock if no separate one
+                null // reuse the home bitmap at apply-time without holding a second reference
             }
+            val loadedLockBitmap = lockBitmap
 
             // 4. Apply the wallpaper(s)
             val wallpaperManager = WallpaperManager.getInstance(applicationContext)
 
             when (target) {
                 SlideshowTarget.HOME_SCREEN -> {
-                    wallpaperManager.setBitmap(homeBitmap, null, true, WallpaperManager.FLAG_SYSTEM)
+                    wallpaperManager.setBitmap(loadedHomeBitmap, null, true, WallpaperManager.FLAG_SYSTEM)
                     FluxaLog.d("SlideshowWorker: Completed setting home screen wallpaper.")
                     repository.recordWallpaperAction(homeWallpaper, WallpaperAction.SET)
                 }
                 SlideshowTarget.LOCK_SCREEN -> {
-                    wallpaperManager.setBitmap(homeBitmap, null, true, WallpaperManager.FLAG_LOCK)
+                    wallpaperManager.setBitmap(loadedHomeBitmap, null, true, WallpaperManager.FLAG_LOCK)
                     FluxaLog.d("SlideshowWorker: Completed setting lock screen wallpaper.")
                     repository.recordWallpaperAction(homeWallpaper, WallpaperAction.SET)
                 }
                 SlideshowTarget.BOTH -> {
                     // Set different wallpapers for home and lock screens
-                    wallpaperManager.setBitmap(homeBitmap, null, true, WallpaperManager.FLAG_SYSTEM)
+                    wallpaperManager.setBitmap(loadedHomeBitmap, null, true, WallpaperManager.FLAG_SYSTEM)
                     repository.recordWallpaperAction(homeWallpaper, WallpaperAction.SET)
 
-                    if (lockBitmap != null) {
-                        wallpaperManager.setBitmap(lockBitmap, null, true, WallpaperManager.FLAG_LOCK)
+                    if (loadedLockBitmap != null) {
+                        wallpaperManager.setBitmap(loadedLockBitmap, null, true, WallpaperManager.FLAG_LOCK)
                         if (lockWallpaper != null && lockWallpaper.id != homeWallpaper.id) {
                             repository.recordWallpaperAction(lockWallpaper, WallpaperAction.SET)
                         }
                         FluxaLog.d("SlideshowWorker: Completed setting different home and lock screen wallpapers.")
                     } else {
                         // Fallback: same wallpaper for both
-                        wallpaperManager.setBitmap(homeBitmap, null, true, WallpaperManager.FLAG_LOCK)
+                        wallpaperManager.setBitmap(loadedHomeBitmap, null, true, WallpaperManager.FLAG_LOCK)
                         FluxaLog.d("SlideshowWorker: Completed setting home and lock screen wallpaper (same image fallback).")
                     }
                 }
             }
 
             result = Result.success()
+        } catch (e: OutOfMemoryError) {
+            FluxaLog.e("SlideshowWorker: Out of memory applying wallpaper: ${e.message}", e)
+            result = Result.failure()
         } catch (e: Exception) {
             FluxaLog.e("SlideshowWorker: Exception applying wallpaper: ${e.message}", e)
             result = Result.failure()
         } finally {
+            // Free the bitmaps promptly rather than waiting on GC; this worker may run again soon.
+            try {
+                if (homeBitmap?.isRecycled == false) homeBitmap.recycle()
+                if (lockBitmap?.isRecycled == false && lockBitmap !== homeBitmap) lockBitmap.recycle()
+            } catch (e: Exception) {
+                FluxaLog.e("SlideshowWorker: Error recycling bitmaps: ${e.message}", e)
+            }
+
             // Always reschedule the next run after each execution (even on failure and retry) so the
-            // chain never breaks.
-            if (repository.getSlideshowEnabled()) {
-                val nextInterval = repository.getSlideshowIntervalEnum()
-                scheduleOneShot(applicationContext, nextInterval)
+            // chain never breaks. Keep this isolated so a transient scheduling/prefs failure does
+            // not escape doWork() and permanently stop the self-rescheduling chain.
+            try {
+                if (repository.getSlideshowEnabled()) {
+                    val nextInterval = repository.getSlideshowIntervalEnum()
+                    scheduleOneShot(applicationContext, nextInterval)
+                }
+            } catch (e: Throwable) {
+                FluxaLog.e("SlideshowWorker: Failed to reschedule next rotation, falling back to default interval: ${e.message}", e)
+                try {
+                    scheduleOneShot(applicationContext, SlideshowInterval.ONE_HOUR)
+                } catch (e2: Throwable) {
+                    FluxaLog.e("SlideshowWorker: Fallback reschedule also failed: ${e2.message}", e2)
+                }
             }
         }
 
         return@withContext result
     }
 
-    private fun downloadBitmap(urlString: String): Bitmap? {
+    private fun downloadBitmap(urlString: String, maxDimension: Int = 4096): Bitmap? {
         return try {
             val url = URL(urlString)
             val connection = url.openConnection()
@@ -158,7 +195,7 @@ class SlideshowWorker(
             connection.readTimeout = 15000
             connection.connect()
             val inputStream = connection.getInputStream()
-            BitmapUtils.safeDecodeStream(inputStream)
+            BitmapUtils.safeDecodeStream(inputStream, maxDimension)
         } catch (e: Exception) {
             FluxaLog.e("Failed to download bitmap from url $urlString: ${e.message}", e)
             null
@@ -197,6 +234,8 @@ class SlideshowWorker(
             val request = OneTimeWorkRequestBuilder<SlideshowWorker>()
                 .addTag(WORK_TAG)
                 .setInitialDelay(interval.durationMinutes, TimeUnit.MINUTES)
+                // Ask the OS to run this close to its scheduled time when quota allows it.
+                .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
                 .build()
 
             workManager.enqueueUniqueWork(
