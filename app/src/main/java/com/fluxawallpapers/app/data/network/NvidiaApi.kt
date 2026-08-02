@@ -15,7 +15,15 @@ data class NvidiaChatRequest(
 @JsonClass(generateAdapter = true)
 data class NvidiaMessage(
     @field:Json(name = "role") val role: String,
-    @field:Json(name = "content") val content: Any // Use Any to support both String and List<NvidiaContent>
+    // Was previously typed `Any` to "support both String and List<NvidiaContent>" — but Moshi's
+    // generated adapter resolves an Any-typed field to its built-in Object adapter, which only
+    // knows how to serialize Map/List/String/Number/Boolean/null. A List<NvidiaContent> (a custom
+    // data class) doesn't fall into any of those, so every request body build threw
+    // IllegalArgumentException, meaning analyzeImage() ALWAYS failed and AI-based similar-wallpaper
+    // lookup was permanently broken. The only value ever constructed here is a
+    // List<NvidiaContent>, so just declare that type directly — Moshi's codegen adapter for it
+    // works fine.
+    @field:Json(name = "content") val content: List<NvidiaContent>
 )
 
 @JsonClass(generateAdapter = true)

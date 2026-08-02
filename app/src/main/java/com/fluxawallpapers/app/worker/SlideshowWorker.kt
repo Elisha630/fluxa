@@ -230,12 +230,9 @@ class SlideshowWorker(
         fun scheduleOneShot(context: Context, interval: SlideshowInterval) {
             val workManager = WorkManager.getInstance(context)
 
-            @Suppress("DEPRECATION")
             val request = OneTimeWorkRequestBuilder<SlideshowWorker>()
                 .addTag(WORK_TAG)
                 .setInitialDelay(interval.durationMinutes, TimeUnit.MINUTES)
-                // Ask the OS to run this close to its scheduled time when quota allows it.
-                .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
                 .build()
 
             workManager.enqueueUniqueWork(

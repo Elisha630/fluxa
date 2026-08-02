@@ -167,6 +167,35 @@ class FirebaseManager(private val context: Context) {
         }
     }
 
+    /**
+     * Like [getTopTags] but preserves the actual score for each tag, so callers can weight
+     * Firebase-derived preferences against local ones instead of treating every returned tag
+     * as equally strong. Only returns tags with a positive score (negative-weighted / disliked
+     * tags should never be used to seek out MORE of that content).
+     */
+    suspend fun getTopTagsWithScores(limit: Int = 10): List<Pair<String, Double>> {
+        val uid = ensureAuthenticated() ?: return emptyList()
+        return try {
+            val doc = db.collection("users").document(uid)
+                .collection("preferences")
+                .document("scores")
+                .get()
+                .await()
+
+            if (!doc.exists()) return emptyList()
+
+            val scores = doc.data ?: return emptyList()
+            scores.mapNotNull { (tag, score) ->
+                if (score is Number && score.toDouble() > 0.0) tag to score.toDouble() else null
+            }
+            .sortedByDescending { it.second }
+            .take(limit)
+        } catch (e: Exception) {
+            FluxaLog.e("Failed to get top tags with scores: ${e.message}")
+            emptyList()
+        }
+    }
+
     suspend fun searchWallpapersByTagPrefix(prefix: String, limit: Long = 20): List<Map<String, Any>> {
         val clean = prefix.trim().lowercase()
         if (clean.isEmpty()) return emptyList()

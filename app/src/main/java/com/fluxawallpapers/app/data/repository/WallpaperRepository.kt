@@ -1,11 +1,13 @@
 package com.fluxawallpapers.app.data.repository
 
 import android.content.Context
+import android.graphics.BitmapFactory
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.Environment
 import androidx.core.content.edit
 import com.fluxawallpapers.app.BuildConfig
+import com.fluxawallpapers.app.data.BitmapUtils
 import com.fluxawallpapers.app.data.database.WallpaperDao
 import com.fluxawallpapers.app.data.model.*
 import com.fluxawallpapers.app.data.network.*
@@ -16,6 +18,9 @@ import com.fluxawallpapers.app.util.PinterestScraper
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
@@ -197,9 +202,8 @@ class WallpaperRepository(
                 )
 
                 val content = response.choices.firstOrNull()?.message?.content ?: return@execute null
-                // Strip markdown backticks if present
-                val jsonStr = content.trim().removeSurrounding("```json", "```").trim()
-                
+                val jsonStr = extractJsonObject(content) ?: return@execute null
+
                 val aiData = moshi.adapter(AiResponseContent::class.java).fromJson(jsonStr) ?: return@execute null
                 
                 val entity = AiMetadataEntity(
@@ -219,6 +223,29 @@ class WallpaperRepository(
                 null
             }
         }
+    }
+
+    /**
+     * Vision models are inconsistent about how they wrap JSON in prose/markdown — some use
+     * ```json fences, some use plain ``` fences, some add a sentence before/after, some don't
+     * fence at all. Instead of matching one exact fence style (which silently failed for
+     * anything else and made the whole AI path look "broken"), just grab the first balanced
+     * {...} block found anywhere in the text.
+     */
+    private fun extractJsonObject(raw: String): String? {
+        val start = raw.indexOf('{')
+        if (start == -1) return null
+        var depth = 0
+        for (i in start until raw.length) {
+            when (raw[i]) {
+                '{' -> depth++
+                '}' -> {
+                    depth--
+                    if (depth == 0) return raw.substring(start, i + 1)
+                }
+            }
+        }
+        return null
     }
 
     private fun WallpaperEntity.toWallpaper(): Wallpaper {
@@ -1074,46 +1101,74 @@ class WallpaperRepository(
 
     // Recommendation logic: Hybrid Firebase + Local tag preferences
     suspend fun getRecommendations(limit: Int): List<Wallpaper> = withContext(Dispatchers.IO) {
-        // 1. Get interests from both sources
-        val firebaseTags = try {
-            firebaseManager.getTopTags(3)
+        // 1. Get interests from both sources, WITH their scores this time — previously
+        // getTopTags() discarded the actual weight, so every Firebase tag was treated as equally
+        // strong as every local tag regardless of how much (or little) signal backed it.
+        val firebaseTagScores = try {
+            firebaseManager.getTopTagsWithScores(10)
         } catch (_: Exception) {
-            emptyList<String>()
+            emptyList()
         }
-        
+
         val localPreferenceTags = wallpaperDao.getPreferenceTags().filter { it.weight > 0f }
-        
-        // 2. Select tags to query
-        val selectTags = mutableSetOf<String>()
-        selectTags.addAll(firebaseTags)
-        
-        if (selectTags.size < 5 && localPreferenceTags.isNotEmpty()) {
-            val totalWeight = localPreferenceTags.sumOf { it.weight.toDouble() }
-            if (totalWeight > 0.0) {
-                // Weighted random selection for remaining slots
-                val localTagsSorted = localPreferenceTags.sortedByDescending { it.weight }
-                localTagsSorted.take(3).forEach { selectTags.add(it.tag) }
-            }
+
+        // 2. Merge into a single tag -> score map. Both sources use the same underlying
+        // action weights (SET/SAVE/VIEW_LONG/SKIP), so their magnitudes are directly comparable;
+        // summing lets a tag reinforced through both local and cloud signals rank higher than one
+        // seen through only one source.
+        val combinedScores = mutableMapOf<String, Double>()
+        for ((tag, score) in firebaseTagScores) {
+            val normalized = tag.trim().lowercase()
+            if (normalized.isNotEmpty()) combinedScores[normalized] = (combinedScores[normalized] ?: 0.0) + score
+        }
+        for (pref in localPreferenceTags) {
+            val normalized = pref.tag.trim().lowercase()
+            if (normalized.isNotEmpty()) combinedScores[normalized] = (combinedScores[normalized] ?: 0.0) + pref.weight
         }
 
-        if (selectTags.isEmpty()) return@withContext emptyList()
+        // Only ever seek out MORE of what's positively scored — a tag with a net-negative score
+        // means the user has actively skipped that kind of content more than they've engaged
+        // with it, so it has no business being used to find recommendations.
+        val positiveTags = combinedScores.filter { it.value > 0.0 }
+        if (positiveTags.isEmpty()) return@withContext emptyList()
 
-        // 3. Fetch candidate wallpapers from APIs using top tags
+        val tagsRankedByScore = positiveTags.entries.sortedByDescending { it.value }.map { it.key }
+
+        // 3. Query a broader set of top tags (weighted toward the strongest ones, with a little
+        // randomness among the rest for freshness) instead of just 2 uniformly-random tags from
+        // a tiny pool of 5 — that discarded most of the signal we just computed.
+        val topGuaranteed = tagsRankedByScore.take(3)
+        val remainderPool = tagsRankedByScore.drop(3)
+        val tagsToQuery = (topGuaranteed + remainderPool.shuffled().take(2)).distinct().take(5)
+
+        // 4. Fetch candidates, excluding anything already pinned — a "recommendation" the user
+        // already saved isn't new to them.
+        val pinnedIds = wallpaperDao.getPinnedWallpapers().first().map { it.id }.toSet()
         val recWallpapers = mutableListOf<Wallpaper>()
-        // Save quota: only pick 2 random tags from the top pool to diversify feed without blasting APIs
-        val tagsToQuery = selectTags.toList().shuffled().take(2)
-        
         for (tag in tagsToQuery) {
             try {
-                // Fetch search results matching preferred tags (will hit searchCache if recently queried)
-                val results = searchWallpapers(tag, 1).take(3)
+                val results = searchWallpapers(tag, 1).take(5)
                 recWallpapers.addAll(results)
             } catch (e: Exception) {
                 FluxaLog.e("Error recommending for tag $tag: ${e.message}", e)
             }
         }
 
-        return@withContext recWallpapers.distinctBy { it.id }.shuffled().take(limit)
+        // 5. Rank by the actual combined score of each candidate's matching tags, rather than a
+        // blind shuffle that threw away everything we just computed about relative tag strength.
+        val ranked = recWallpapers
+            .filter { it.id !in pinnedIds }
+            .distinctBy { it.id }
+            .map { wp ->
+                val matchScore = wp.tags.sumOf { tag -> combinedScores[tag.trim().lowercase()] ?: 0.0 }
+                // Small random jitter so near-equal candidates don't always appear in the same order.
+                wp to (matchScore + Random.nextDouble(0.0, 0.5))
+            }
+            .sortedByDescending { it.second }
+            .map { it.first }
+            .take(limit)
+
+        return@withContext ranked
     }
 
     // Smart rotation slideshow: combining selected pool sources and avoiding recently shown
@@ -1244,6 +1299,63 @@ class WallpaperRepository(
         }
     }
 
+    /**
+     * Downloads a wallpaper's (small) thumbnail and computes its average RGB color. This is a
+     * cheap, fully on-device stand-in for "does this look like the source photo" — no network AI
+     * call, typically well under a second even for a dozen candidates in parallel. It's what lets
+     * us narrow down a broad tag like "dark" to results that actually share the source image's
+     * tone, instead of any dark photo at all.
+     */
+    private suspend fun averageThumbnailColor(imageUrl: String): Triple<Int, Int, Int>? = withContext(Dispatchers.IO) {
+        try {
+            val request = Request.Builder().url(imageUrl).build()
+            httpClient.newCall(request).execute().use { response ->
+                val bytes = response.body?.bytes() ?: return@withContext null
+                val boundsOptions = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.size, boundsOptions)
+                if (boundsOptions.outWidth <= 0 || boundsOptions.outHeight <= 0) return@withContext null
+
+                // We only need a handful of samples for an average color — decode tiny.
+                val sampleSize = BitmapUtils.calculateInSampleSize(boundsOptions.outWidth, boundsOptions.outHeight, 32, 32)
+                val decodeOptions = BitmapFactory.Options().apply { inSampleSize = sampleSize }
+                val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, decodeOptions) ?: return@withContext null
+
+                var rSum = 0L
+                var gSum = 0L
+                var bSum = 0L
+                var count = 0L
+                val stepX = maxOf(1, bitmap.width / 12)
+                val stepY = maxOf(1, bitmap.height / 12)
+                var y = 0
+                while (y < bitmap.height) {
+                    var x = 0
+                    while (x < bitmap.width) {
+                        val pixel = bitmap.getPixel(x, y)
+                        rSum += (pixel shr 16) and 0xFF
+                        gSum += (pixel shr 8) and 0xFF
+                        bSum += pixel and 0xFF
+                        count++
+                        x += stepX
+                    }
+                    y += stepY
+                }
+                bitmap.recycle()
+                if (count == 0L) return@withContext null
+                Triple((rSum / count).toInt(), (gSum / count).toInt(), (bSum / count).toInt())
+            }
+        } catch (e: Exception) {
+            FluxaLog.d("Color sampling skipped for $imageUrl: ${e.message}")
+            null
+        }
+    }
+
+    private fun colorDistance(a: Triple<Int, Int, Int>, b: Triple<Int, Int, Int>): Double {
+        val dr = (a.first - b.first).toDouble()
+        val dg = (a.second - b.second).toDouble()
+        val db = (a.third - b.third).toDouble()
+        return kotlin.math.sqrt(dr * dr + dg * dg + db * db) // 0 (identical) .. ~441 (max)
+    }
+
     suspend fun getSimilarWallpapers(wallpaper: Wallpaper, limit: Int = 10): List<Wallpaper> = withContext(Dispatchers.IO) {
         val hash = HashUtils.sha256(wallpaper.imageUrl)
         
@@ -1264,7 +1376,10 @@ class WallpaperRepository(
         val aiMetadata = withTimeoutOrNull(8000) {
             analyzeAndCache(wallpaper)
         }
-        
+
+        // Reference color for reranking, computed once and reused by both the AI and fallback paths.
+        val sourceColor = averageThumbnailColor(wallpaper.thumbnailUrl)
+
         if (aiMetadata != null) {
             val queries = aiMetadata.searchQueries.split(",").filter { it.isNotBlank() }
             
@@ -1281,18 +1396,11 @@ class WallpaperRepository(
                     }
                 }
 
-                // Deduplicate and Rank — items in multiple queries rank higher
-                val ranked = allResults
-                    .filter { it.id != wallpaper.id }
-                    .groupBy { it.id }
-                    .map { (_, list) ->
-                        val wp = list.first()
-                        val score = list.size.toDouble() + Random.nextDouble()
-                        wp to score
-                    }
-                    .sortedByDescending { it.second }
-                    .map { it.first }
-                    .take(limit)
+                // Dedupe, then rank by (a) how many of the AI's queries surfaced this candidate,
+                // and (b) how close its color is to the source photo, so we don't just get
+                // "loosely on-theme" results but ones that actually look similar.
+                val candidates = allResults.filter { it.id != wallpaper.id }.groupBy { it.id }.map { it.value.first() to it.value.size }
+                val ranked = rankByColorAndOverlap(candidates, sourceColor, limit)
 
                 if (ranked.isNotEmpty()) {
                     wallpaperDao.insertRecommendationCache(
@@ -1307,7 +1415,16 @@ class WallpaperRepository(
             }
         }
 
-        // 3. Fallback: tag-based search when Nvidia is slow, unavailable or returned no results
+        // 3. Fallback: tag-based search when Nvidia is slow, unavailable or returned no results.
+        //
+        // Previously this concatenated just the top 2 tags into a single search string (e.g.
+        // "dark car" as one literal query), which is very lossy — a broad tag like "dark" would
+        // dominate and pull back any dark photo at all, not ones that actually resemble the
+        // source. Instead: query each meaningful tag SEPARATELY to gather a wider candidate pool,
+        // then rank candidates by how many of the source wallpaper's own tags they share PLUS how
+        // close their average color is to the source photo. That color signal is what lets us
+        // tell a black car apart from a dark forest even though both are tagged "dark" — without
+        // depending on a slow/unreliable cloud vision model to do it.
         FluxaLog.d("Nvidia slow/unavailable for ${wallpaper.id}, falling back to tag-based similar search")
 
         val noiseWords = setOf("unsplash", "pexels", "pixabay", "pinterest",
@@ -1315,27 +1432,76 @@ class WallpaperRepository(
             "background", "hd", "4k", "8k", "download", "free", "best",
             "top", "new", "popular", "trending", "awesome", "cool", "nice")
 
+        val sourceTags = wallpaper.tags.map { it.lowercase().trim() }.toSet()
         val meaningfulTags = wallpaper.tags
             .map { it.lowercase().trim() }
             .filter { it.length >= 2 && it !in noiseWords }
             .distinct()
 
-        val fallbackQuery = when {
-            meaningfulTags.size >= 2 -> "${meaningfulTags[0]} ${meaningfulTags[1]}"
-            meaningfulTags.size == 1 -> meaningfulTags[0]
-            else -> "background"
+        val fallbackTagPool = if (meaningfulTags.isNotEmpty()) meaningfulTags.take(4) else listOf("background")
+
+        val fallbackResults = mutableListOf<Wallpaper>()
+        for (tag in fallbackTagPool) {
+            try {
+                fallbackResults.addAll(searchWallpapers(tag, 1))
+            } catch (e: Exception) {
+                FluxaLog.e("Fallback tag search for '$tag' failed: ${e.message}", e)
+            }
         }
 
-        val fallbackResults = try {
-            searchWallpapers(fallbackQuery, 1)
-        } catch (e: Exception) {
-            FluxaLog.e("Fallback similar search failed: ${e.message}", e)
-            emptyList()
-        }
+        val fallbackCandidates = fallbackResults
+            .filter { it.id != wallpaper.id }
+            .distinctBy { it.id }
+            .map { wp -> wp to wp.tags.map { it.lowercase().trim() }.count { it in sourceTags } }
 
-        val finalResults = fallbackResults.filter { it.id != wallpaper.id }.take(limit)
-        FluxaLog.d("Similar for ${wallpaper.id} resolved via fallback ($fallbackQuery): ${finalResults.size} results")
+        val finalResults = rankByColorAndOverlap(fallbackCandidates, sourceColor, limit)
+        FluxaLog.d("Similar for ${wallpaper.id} resolved via tag fallback (${fallbackTagPool.joinToString(", ")}): ${finalResults.size} results")
         return@withContext finalResults
+    }
+
+    /**
+     * Shared ranking step for [getSimilarWallpapers]: takes candidates paired with a tag-overlap
+     * score, downloads their (small) thumbnails in parallel to compare average color against the
+     * source, and combines both signals into a final ranking. Falls back to overlap-only ranking
+     * if the source color couldn't be determined (e.g. offline).
+     */
+    private suspend fun rankByColorAndOverlap(
+        candidates: List<Pair<Wallpaper, Int>>,
+        sourceColor: Triple<Int, Int, Int>?,
+        limit: Int
+    ): List<Wallpaper> = coroutineScope {
+        if (candidates.isEmpty()) return@coroutineScope emptyList()
+
+        // Cap how many thumbnails we bother downloading for color comparison — this is a
+        // reranking step, not the primary filter, so we don't need to sample every candidate.
+        val toSample = candidates.sortedByDescending { it.second }.take(24)
+
+        val withColor = if (sourceColor != null) {
+            val deferred = toSample.map { (wp, overlap) ->
+                async { Triple(wp, overlap, averageThumbnailColor(wp.thumbnailUrl)) }
+            }
+            deferred.awaitAll()
+        } else {
+            toSample.map { (wp, overlap) -> Triple(wp, overlap, null) }
+        }
+
+        withColor
+            .map { (wp, overlap, color) ->
+                val colorScore = if (sourceColor != null && color != null) {
+                    // Convert distance (0 best..~441 worst) into a 0..1 similarity so it combines
+                    // sensibly with the (unbounded but usually small) tag-overlap count.
+                    (1.0 - (colorDistance(sourceColor, color) / 441.0)).coerceIn(0.0, 1.0)
+                } else {
+                    0.0
+                }
+                // Tag overlap is the primary signal (an actual shared subject/theme beats color
+                // alone), color similarity breaks ties and narrows an overly broad shared tag.
+                val score = overlap * 2.0 + colorScore + Random.nextDouble(0.0, 0.05)
+                wp to score
+            }
+            .sortedByDescending { it.second }
+            .map { it.first }
+            .take(limit)
     }
 
     suspend fun fetchGoogleAutoSuggestions(query: String): List<String> = withContext(Dispatchers.IO) {
